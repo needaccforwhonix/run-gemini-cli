@@ -15,10 +15,12 @@
 # limitations under the License.
 
 # Universal Direct Workload Identity Federation Setup Script for GitHub Actions
-# This script sets up Google Cloud Direct Workload Identity Federation for any GitHub repository
-# to work with the google-github-actions/auth action.
+# The original script sets up Google Cloud Direct Workload Identity Federation for
+# any GitHub repositorty to work with the google-github-actions/auth action.
 # 
-# Uses Direct WIF (preferred): No intermediate service accounts, direct authentication to GCP resources.
+# It has been modified for Gemini CLI, which requires a special WIF setup
+# setup through a Service Account.
+
 
 set -e
 
@@ -211,7 +213,6 @@ print_header "Step 1: Enabling required Google Cloud APIs"
 required_apis=(
     "aiplatform.googleapis.com"
     "cloudaicompanion.googleapis.com"
-    "cloudcode-pa.googleapis.com"
     "cloudresourcemanager.googleapis.com"
     "cloudtrace.googleapis.com"
     "iam.googleapis.com"
@@ -220,7 +221,8 @@ required_apis=(
     "monitoring.googleapis.com"
     "sts.googleapis.com"
 )
-
+# Separately enable the internal-only Cloud Code API, ignoring errors
+# for public users who may not have access.
 gcloud services enable "${required_apis[@]}" --project="${GOOGLE_CLOUD_PROJECT}"
 print_success "APIs enabled successfully."
 
@@ -317,38 +319,10 @@ else
 fi
 
 # Step 4: Grant required permissions to the Workload Identity Pool
-print_header "Step 4: Granting required permissions to Workload Identity Pool"
+print_header "(Skipped) Step 4: Granting required permissions to Workload Identity Pool"
 PRINCIPAL_SET="principalSet://iam.googleapis.com/${WIF_POOL_ID}/attribute.repository/${GITHUB_REPO}"
 
-print_info "Granting required permissions directly to the Workload Identity Pool..."
-
-# Observability permissions
-print_info "Granting logging permissions..."
-gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
-    --role="roles/logging.logWriter" \
-    --member="${PRINCIPAL_SET}" \
-    --condition=None
-
-print_info "Granting monitoring permissions..."
-gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
-    --role="roles/monitoring.metricWriter" \
-    --member="${PRINCIPAL_SET}" \
-    --condition=None
-
-print_info "Granting tracing permissions..."
-gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
-    --role="roles/cloudtrace.agent" \
-    --member="${PRINCIPAL_SET}" \
-    --condition=None
-
-# Model inference permissions
-print_info "Granting vertex permissions..."
-gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
-    --role="roles/aiplatform.user" \
-    --member="${PRINCIPAL_SET}" \
-    --condition=None
-
-print_success "Required permissions granted to Workload Identity Pool"
+print_info "(Skipped) Granting required permissions directly to the Workload Identity Pool..."
 
 # Step 5: Create and Configure Service Account for Gemini CLI
 print_header "Step 5: Create and Configure Service Account for Gemini CLI"
@@ -373,13 +347,33 @@ gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
     --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
     --condition=None
 
-# Allow the service account to generate an access tokens
-print_info "Granting 'Service Account Token Creator' role to Service Account..."
+# Allow the service account to generate access tokens (self-impersonation only)
+print_info "Granting 'Service Account Token Creator' role to Service Account (self-impersonation)..."
 
-gcloud projects add-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
+# Add the self-impersonation binding only if it does not already exist (idempotency guard)
+EXISTING_TOKEN_CREATOR_BINDING=$(gcloud iam service-accounts get-iam-policy "${SERVICE_ACCOUNT_EMAIL}" \
+    --project="${GOOGLE_CLOUD_PROJECT}" \
+    --flatten="bindings[].members" \
+    --filter="bindings.members:${SERVICE_ACCOUNT_EMAIL}" \
+    --format="value(bindings.role)" \
+    2>/dev/null | grep -Fx "roles/iam.serviceAccountTokenCreator" || true)
+
+if [[ -z "${EXISTING_TOKEN_CREATOR_BINDING}" ]]; then
+    gcloud iam service-accounts add-iam-policy-binding "${SERVICE_ACCOUNT_EMAIL}" \
+        --project="${GOOGLE_CLOUD_PROJECT}" \
+        --role="roles/iam.serviceAccountTokenCreator" \
+        --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}"
+fi
+
+# Remove the legacy project-level Token Creator binding from pre-#530 installs so
+# existing setups also converge to self-impersonation. Ignore errors if the binding
+# was never granted at the project level.
+print_info "Removing legacy project-level 'Service Account Token Creator' binding (if present)..."
+gcloud projects remove-iam-policy-binding "${GOOGLE_CLOUD_PROJECT}" \
     --role="roles/iam.serviceAccountTokenCreator" \
     --member="serviceAccount:${SERVICE_ACCOUNT_EMAIL}" \
-    --condition=None
+    --condition=None \
+    2>/dev/null || true
 
 # Grant logging permissions to the service account
 print_info "Granting 'Logging Writer' role to Service Account..."
